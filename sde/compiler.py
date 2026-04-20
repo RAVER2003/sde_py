@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,99 @@ from pathlib import Path
 from typing import Any
 
 from .env import sde_cli_path, env_path
+
+
+# ── Unsupported-function patching ───────────────────────────────────────────
+
+# Maps SDE-unsupported Vensim function names →
+#   (replacement_name, n_args_to_keep, note)
+# n_args_to_keep: how many of the original's arguments to forward (rest dropped)
+_UNSUPPORTED_SUBSTITUTIONS: dict[str, tuple[str, int, str]] = {
+    "DELAY FIXED": (
+        "DELAY3",
+        2,
+        "DELAY3 is a 3rd-order exponential approximation; initial-value arg dropped",
+    ),
+}
+
+# Match any unsupported function name (case-insensitive, flexible whitespace)
+_PATCH_RE = re.compile(
+    r"(?i)(" + "|".join(re.escape(k) for k in _UNSUPPORTED_SUBSTITUTIONS) + r")\s*(?=\()"
+)
+
+
+def _extract_n_args(text: str, start: int, n: int) -> tuple[str, int]:
+    """
+    Starting at `start` (the opening '(' in `text`), extract the first `n`
+    comma-separated arguments respecting parenthesis/bracket nesting.
+    Returns (joined_args_string, index_after_closing_paren).
+    """
+    assert text[start] == "("
+    args: list[str] = []
+    depth = 0
+    current: list[str] = []
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch in "([":
+            depth += 1
+            if depth > 1:           # depth==1 is the outer call paren — don't include it
+                current.append(ch)
+        elif ch in ")]":
+            depth -= 1
+            if depth == 0:
+                # closing paren of the function call
+                args.append("".join(current).strip())
+                return ", ".join(args[:n]), i + 1
+            current.append(ch)
+        elif ch == "," and depth == 1:
+            args.append("".join(current).strip())
+            current = []
+            if len(args) == n:
+                # Skip remaining args — find matching close paren
+                depth_inner = 1
+                i += 1
+                while i < len(text) and depth_inner > 0:
+                    if text[i] in "([":
+                        depth_inner += 1
+                    elif text[i] in ")]":
+                        depth_inner -= 1
+                    i += 1
+                return ", ".join(args[:n]), i
+        else:
+            current.append(ch)
+        i += 1
+    # fallback: return what we have
+    return ", ".join(args[:n]), i
+
+
+def _patch_unsupported_functions(mdl_text: str, verbose: bool) -> tuple[str, list[str]]:
+    """
+    Replace Vensim functions that SDE's JS code-gen does not implement with
+    supported approximations.  Returns (patched_text, list_of_warnings).
+    """
+    warnings: list[str] = []
+    result: list[str] = []
+    pos = 0
+
+    for m in _PATCH_RE.finditer(mdl_text):
+        raw_name = re.sub(r"\s+", " ", m.group(1).upper().strip())
+        replacement, n_keep, note = _UNSUPPORTED_SUBSTITUTIONS[raw_name]
+
+        # Copy text before this match
+        result.append(mdl_text[pos:m.start()])
+
+        # Find opening paren (there may be whitespace between name and '(')
+        paren_pos = mdl_text.index("(", m.end())
+        kept_args, after_paren = _extract_n_args(mdl_text, paren_pos, n_keep)
+
+        result.append(f"{replacement}({kept_args})")
+        pos = after_paren
+
+        warnings.append(f"'{raw_name}' → '{replacement}({kept_args})' ({note})")
+
+    result.append(mdl_text[pos:])
+    return "".join(result), warnings
 
 
 # ── Config generation ───────────────────────────────────────────────────────
@@ -154,6 +248,21 @@ def compile_mdl(
     if verbose:
         print(f"Compiling {mdl_path.name} ...")
 
+    # ── Pre-process: patch unsupported Vensim functions ──────────────────────
+    mdl_text = mdl_path.read_text(encoding="utf-8", errors="replace")
+    patched_text, patch_warnings = _patch_unsupported_functions(mdl_text, verbose)
+    if patch_warnings:
+        seen_fns: set[str] = set()
+        for w in patch_warnings:
+            fn = w.split("'")[1]  # e.g. 'DELAY FIXED'
+            replacement = _UNSUPPORTED_SUBSTITUTIONS[fn][0]
+            if fn not in seen_fns:
+                seen_fns.add(fn)
+                print(
+                    f"  ⚠ WARNING: '{fn}' is not supported by SDE — approximated as "
+                    f"'{replacement}'. Results may differ from Vensim. See LIMITATIONS.md."
+                )
+
     # Run compilation inside ~/.sde_env/compile-workspace/ so that Node's
     # standard upward module resolution finds ~/.sde_env/node_modules/.
     # (Node ESM ignores NODE_PATH, so we can't use an arbitrary cwd.)
@@ -163,8 +272,18 @@ def compile_mdl(
 
     # Write support files into the compile workspace
     _write_package_json(compile_ws)
+
+    # If the MDL was patched, write the modified copy into the compile workspace
+    # and compile from that copy.  Otherwise use the original path.
+    if patch_warnings:
+        patched_mdl = compile_ws / "_model_patched.mdl"
+        patched_mdl.write_text(patched_text, encoding="utf-8")
+        compile_mdl_path = patched_mdl
+    else:
+        compile_mdl_path = mdl_path
+
     _generate_sde_config(
-        mdl_path=mdl_path,
+        mdl_path=compile_mdl_path,
         inputs=meta["inputs"],
         outputs=meta["outputs"],
         cache_dir=compile_ws,

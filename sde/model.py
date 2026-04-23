@@ -18,8 +18,6 @@ Workflow::
     m.derive('revenue', lambda r: r.total_inventory * 10)
     result2 = m.run()
     print(result2.revenue)
-
-    sensitivity = m.sensitivity('production_slope', [1, 3, 5, 7, 10])
 """
 
 from __future__ import annotations
